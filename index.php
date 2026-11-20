@@ -6,10 +6,26 @@ header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
 header('Cache-Control: no-store, private');
 header('X-Frame-Options: DENY');
+header("Content-Security-Policy: default-src 'none'; style-src 'self' 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
 
 const DEFAULT_REFRESH = 5;
 const MIN_REFRESH = 2;
 const MAX_REFRESH = 300;
+const MAX_FILTER_LENGTH = 160;
+const MAX_COMMAND_LENGTH = 1024;
+const MAX_CACHE_BYTES = 8388608;
+const CACHE_MAX_AGE = 600;
+
+function lightweightMode(): bool
+{
+    return ($_GET['light'] ?? '') === '1';
+}
+
+function readBootId(): string
+{
+    return readFirstLine('/proc/sys/kernel/random/boot_id') ?? '';
+}
+
 
 function h(string $value): string
 {
@@ -220,7 +236,8 @@ function uidToUsername(int $uid): string
         }
     }
 
-    $passwd = readFileSafe('/etc/passwd');
+    static $passwd = null;
+    $passwd ??= readFileSafe('/etc/passwd') ?? '';
 
     if ($passwd !== null) {
         foreach (explode("\n", $passwd) as $line) {
@@ -331,7 +348,7 @@ function readCommandLine(int $pid, string $fallback): string
         return '[' . $fallback . ']';
     }
 
-    $command = str_replace("\0", ' ', $data);
+    $command = str_replace("\0", ' ', substr($data, 0, MAX_COMMAND_LENGTH));
     $command = trim(preg_replace('/\s+/', ' ', $command) ?? '');
 
     return $command !== '' ? $command : '[' . $fallback . ']';
@@ -356,8 +373,11 @@ function readProcessCgroup(int $pid): string
 
 function deriveSystemdUnit(string $cgroup): string
 {
-    if (preg_match('~(?:^|/)([^/]+\.(?:service|scope|slice))(?:/|$)~', $cgroup, $m)) {
-        return $m[1];
+    if (preg_match_all('~(?:^|/)([^/]+\.(?:service|scope))(?:/|$)~', $cgroup, $m) && $m[1] !== []) {
+        return end($m[1]);
+    }
+    if (preg_match_all('~(?:^|/)([^/]+\.slice)(?:/|$)~', $cgroup, $m) && $m[1] !== []) {
+        return end($m[1]);
     }
     return '';
 }
@@ -406,36 +426,52 @@ function readPressure(string $resource): ?array
 
 function applyCpuSamples(array &$processes, int $ticks): ?float
 {
-    $cache = sys_get_temp_dir() . '/procstat-' . hash('sha256', __FILE__) . '.json';
+    $cacheDir = sys_get_temp_dir() . '/procstat-' . (string)getmyuid();
+    if (!is_dir($cacheDir)) @mkdir($cacheDir, 0700);
+    $dirInfo = @stat($cacheDir);
+    if ($dirInfo === false || (function_exists('posix_geteuid') && $dirInfo['uid'] !== posix_geteuid()) || ($dirInfo['mode'] & 0077) !== 0) return null;
+    $cache = $cacheDir . '/' . hash('sha256', __FILE__) . '.json';
+    if (is_link($cache)) return null;
     $handle = @fopen($cache, 'c+');
-    if ($handle === false) {
-        return null;
-    }
+    if ($handle === false) return null;
+    @chmod($cache, 0600);
     if (!flock($handle, LOCK_EX)) {
         fclose($handle);
         return null;
     }
-    rewind($handle);
-    $old = json_decode(stream_get_contents($handle) ?: '', true);
-    $now = microtime(true);
-    $elapsed = is_array($old) ? $now - (float)($old['timestamp'] ?? 0) : 0;
-    $valid = $elapsed >= 0.2 && $elapsed <= 600;
-    $previous = is_array($old) && isset($old['processes']) && is_array($old['processes']) ? $old['processes'] : [];
+    $info = fstat($handle);
+    $raw = ($info !== false && $info['size'] <= MAX_CACHE_BYTES) ? stream_get_contents($handle) : '';
+    $old = json_decode(is_string($raw) ? $raw : '', true);
+    $now = hrtime(true) / 1e9;
+    $boot = readBootId();
+    $elapsed = is_array($old) ? $now - (float)($old['monotonic'] ?? 0) : 0.0;
+    $valid = $elapsed >= 0.2 && $elapsed <= CACHE_MAX_AGE
+        && is_array($old) && ($old['boot'] ?? null) === $boot;
+    $previous = $valid && isset($old['processes']) && is_array($old['processes']) ? $old['processes'] : [];
     $current = [];
     foreach ($processes as &$process) {
         $identity = $process['identity'];
-        $current[$identity] = $process['cpu_ticks'];
+        $current[$identity] = [
+            $process['cpu_ticks'],
+            $process['io_read'],
+            $process['io_write'],
+        ];
         $process['cpu_interval'] = null;
-        if ($valid && isset($previous[$identity])) {
-            $delta = $process['cpu_ticks'] - (int)$previous[$identity];
-            if ($delta >= 0) {
-                $process['cpu_interval'] = 100.0 * $delta / ($ticks * $elapsed);
-            }
+        $process['io_read_rate'] = null;
+        $process['io_write_rate'] = null;
+        if (!$valid || !isset($previous[$identity]) || !is_array($previous[$identity])) continue;
+        $oldEntry = $previous[$identity];
+        $delta = $process['cpu_ticks'] - (int)($oldEntry[0] ?? 0);
+        if ($delta >= 0) $process['cpu_interval'] = 100.0 * $delta / ($ticks * $elapsed);
+        foreach (['io_read_rate' => [1, 'io_read'], 'io_write_rate' => [2, 'io_write']] as $rate => [$index, $key]) {
+            if ($process[$key] === null || !isset($oldEntry[$index])) continue;
+            $diff = $process[$key] - (int)$oldEntry[$index];
+            if ($diff >= 0) $process[$rate] = $diff / $elapsed;
         }
     }
     unset($process);
-    $encoded = json_encode(['timestamp' => $now, 'processes' => $current]);
-    if ($encoded !== false) {
+    $encoded = json_encode(['monotonic' => $now, 'boot' => $boot, 'processes' => $current]);
+    if ($encoded !== false && strlen($encoded) <= MAX_CACHE_BYTES) {
         rewind($handle);
         ftruncate($handle, 0);
         fwrite($handle, $encoded);
@@ -464,8 +500,8 @@ function readProcess(int $pid, float $uptime, int $clockTicks): ?array
 
     $status = parseStatus("$base/status");
     $cgroup = readProcessCgroup($pid);
-    $io = readProcessIo($pid);
-    $fdCount = countProcessFds($pid);
+    $io = lightweightMode() ? ['read_bytes' => null, 'write_bytes' => null] : readProcessIo($pid);
+    $fdCount = lightweightMode() ? null : countProcessFds($pid);
 
     $ticks = $stat['utime'] + $stat['stime'];
     $cpuTime = $ticks / $clockTicks;
@@ -660,6 +696,8 @@ $allowedSorts = [
     'fd_count',
     'io_read',
     'io_write',
+    'io_read_rate',
+    'io_write_rate',
     'unit',
     'cgroup',
     'cpu_time',
@@ -673,13 +711,13 @@ $allowedSorts = [
     'command',
 ];
 
-$filter = requestString('q');
-$sort = requestString('sort', 'cpu_percent');
+$filter = function_exists('mb_substr') ? mb_substr(requestString('q'), 0, MAX_FILTER_LENGTH, 'UTF-8') : substr(requestString('q'), 0, MAX_FILTER_LENGTH);
+$sort = requestString('sort', 'cpu_interval');
 $direction = strtolower(requestString('dir', 'desc'));
 $refresh = requestInt('refresh', DEFAULT_REFRESH);
 
 if (!in_array($sort, $allowedSorts, true)) {
-    $sort = 'cpu_percent';
+    $sort = 'cpu_interval';
 }
 
 if (!in_array($direction, ['asc', 'desc'], true)) {
@@ -704,11 +742,12 @@ foreach ($processes as $process) {
 }
 
 if ($filter !== '') {
-    $needle = mb_strtolower($filter, 'UTF-8');
+    $lower = static fn(string $value): string => function_exists('mb_strtolower') ? mb_strtolower($value, 'UTF-8') : strtolower($value);
+    $needle = $lower($filter);
 
     $processes = array_values(array_filter(
         $processes,
-        static function (array $process) use ($needle): bool {
+        static function (array $process) use ($needle, $lower): bool {
             $haystack = implode(' ', [
                 (string)$process['pid'],
                 (string)$process['ppid'],
@@ -721,7 +760,7 @@ if ($filter !== '') {
             ]);
 
             return str_contains(
-                mb_strtolower($haystack, 'UTF-8'),
+                $lower($haystack),
                 $needle
             );
         }
@@ -735,9 +774,9 @@ usort(
         $right = $b[$sort] ?? null;
 
         if ($left === null && $right !== null) {
-            $result = 1;
+            return 1;
         } elseif ($right === null && $left !== null) {
-            $result = -1;
+            return -1;
         } elseif (is_string($left) && is_string($right)) {
             $result = strnatcasecmp($left, $right);
         } else {
@@ -796,6 +835,7 @@ function sortUrl(string $column): string
         'sort' => $column,
         'dir' => $newDirection,
         'refresh' => $refresh,
+        'light' => lightweightMode() ? 1 : 0,
     ]);
 }
 
@@ -818,6 +858,7 @@ $currentUrl = '?' . http_build_query([
     'sort' => $sort,
     'dir' => $direction,
     'refresh' => $refresh,
+    'light' => lightweightMode() ? 1 : 0,
 ]);
 ?>
 <!DOCTYPE html>
@@ -1313,7 +1354,7 @@ tbody tr:last-child td {
     <div class="card">
         <div class="card-label">CPU sampling</div>
         <div class="card-value"><?= $sampleElapsed === null ? 'Warming up' : number_format($sampleElapsed, 1) . 's' ?></div>
-        <div class="card-detail">Interval CPU percent · per logical CPU</div>
+        <div class="card-detail">CPU NOW: interval % of one logical CPU · IO rates: bytes/s</div>
     </div>
 </div>
 
@@ -1330,6 +1371,7 @@ tbody tr:last-child td {
 
         <input type="hidden" name="sort" value="<?= h($sort) ?>">
         <input type="hidden" name="dir" value="<?= h($direction) ?>">
+        <label><input type="checkbox" name="light" value="1" <?= lightweightMode() ? 'checked' : '' ?>> Lightweight</label>
 
         <select name="refresh" title="Auto-refresh interval">
             <?php foreach ([2, 5, 10, 15, 30, 60, 120, 300] as $seconds): ?>
@@ -1347,9 +1389,10 @@ tbody tr:last-child td {
         <a
             class="clear"
             href="?<?= h(http_build_query([
-                'sort' => 'cpu_percent',
+                'sort' => 'cpu_interval',
                 'dir' => 'desc',
                 'refresh' => $refresh,
+        'light' => lightweightMode() ? 1 : 0,
             ])) ?>"
         >Reset</a>
 
@@ -1410,6 +1453,8 @@ tbody tr:last-child td {
     <th class="num"><a href="<?= h(sortUrl('fd_count')) ?>">FD<?= h(sortIndicator('fd_count')) ?></a></th>
     <th class="num"><a href="<?= h(sortUrl('io_read')) ?>">IO READ<?= h(sortIndicator('io_read')) ?></a></th>
     <th class="num"><a href="<?= h(sortUrl('io_write')) ?>">IO WRITE<?= h(sortIndicator('io_write')) ?></a></th>
+    <th class="num"><a href="<?= h(sortUrl('io_read_rate')) ?>">READ/s<?= h(sortIndicator('io_read_rate')) ?></a></th>
+    <th class="num"><a href="<?= h(sortUrl('io_write_rate')) ?>">WRITE/s<?= h(sortIndicator('io_write_rate')) ?></a></th>
     <th><a href="<?= h(sortUrl('unit')) ?>">SYSTEMD UNIT<?= h(sortIndicator('unit')) ?></a></th>
     <th><a href="<?= h(sortUrl('cgroup')) ?>">CGROUP<?= h(sortIndicator('cgroup')) ?></a></th>
     <th class="num">
@@ -1474,9 +1519,9 @@ tbody tr:last-child td {
 <?php
 $cpuClass = '';
 
-if ($process['cpu_percent'] >= 80) {
+if (($process['cpu_interval'] ?? $process['cpu_percent']) >= 80) {
     $cpuClass = 'cpu-very-hot';
-} elseif ($process['cpu_percent'] >= 25) {
+} elseif (($process['cpu_interval'] ?? $process['cpu_percent']) >= 25) {
     $cpuClass = 'cpu-hot';
 }
 ?>
@@ -1508,14 +1553,16 @@ if ($process['cpu_percent'] >= 80) {
         </span>
     </td>
 
-    <td class="num <?= h($cpuClass) ?>">
+    <td class="num">
         <?= number_format($process['cpu_percent'], 1) ?>
     </td>
 
-    <td class="num"><?= $process['cpu_interval'] === null ? '—' : number_format($process['cpu_interval'], 1) ?></td>
+    <td class="num <?= h($cpuClass) ?>"><?= $process['cpu_interval'] === null ? '—' : number_format($process['cpu_interval'], 1) ?></td>
     <td class="num"><?= $process['fd_count'] === null ? '—' : number_format($process['fd_count']) ?></td>
     <td class="num"><?= $process['io_read'] === null ? '—' : h(formatBytes($process['io_read'])) ?></td>
     <td class="num"><?= $process['io_write'] === null ? '—' : h(formatBytes($process['io_write'])) ?></td>
+    <td class="num"><?= $process['io_read_rate'] === null ? '—' : h(formatBytes($process['io_read_rate'])) . '/s' ?></td>
+    <td class="num"><?= $process['io_write_rate'] === null ? '—' : h(formatBytes($process['io_write_rate'])) . '/s' ?></td>
     <td class="command" title="<?= h($process['unit']) ?>"><?= h($process['unit'] ?: '—') ?></td>
     <td class="command" title="<?= h($process['cgroup']) ?>"><?= h($process['cgroup'] ?: '—') ?></td>
     <td class="num">
@@ -1579,7 +1626,7 @@ if ($process['cpu_percent'] >= 80) {
     </div>
 
     <div>
-        /proc · PHP <?= h(PHP_VERSION) ?> · ProcStat v2.0 · Cybernetic Garden
+        /proc · PHP <?= h(PHP_VERSION) ?> · ProcStat v2.1 · Cybernetic Garden
     </div>
 </div>
 
